@@ -1,0 +1,14 @@
+[
+    {
+        "label": "STM32 Run",
+        "command": "cargo",
+        "args": ["run"],
+        "use_new_terminal": true
+    },
+    {
+        "label": "STM43 Release Run",
+        "command": "cargo",
+        "args": ["run", "--release"],
+        "use_new_terminal": true
+    }
+]

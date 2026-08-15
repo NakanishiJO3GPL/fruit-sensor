@@ -1,0 +1,11 @@
+[default.general]
+chip = "STM32G431KBTx"
+
+[default.rtt]
+enabled = false
+
+[default.reset]
+enabled = true
+
+[default.flashing]
+enabled = true
