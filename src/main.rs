@@ -376,7 +376,7 @@ fn color_for_slot(slot: usize) -> Rgb565 {
         6 => Rgb565::new(31, 32, 0),  // FXL: 橙
         7 => Rgb565::new(31, 16, 0),  // F6: 赤よりの橙
         8 => Rgb565::new(31, 0, 0),   // F7: 赤
-        9 => Rgb565::new(15, 8, 0),   // F8: 焦げ茶
+        9 => Rgb565::new(28, 16, 0),   // F8: 焦げ茶
         _ => Rgb565::WHITE,           // NIR: 白
     }
 }
