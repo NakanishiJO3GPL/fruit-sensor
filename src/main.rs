@@ -2,6 +2,7 @@
 #![cfg_attr(not(test), no_main)]
 
 mod as7343;
+mod xpt2046;
 
 use panic_halt as _;
 
@@ -10,7 +11,7 @@ use core::cell::RefCell;
 use display_interface_spi::SPIInterface;
 use embassy_executor::Spawner;
 use embassy_stm32::{
-    gpio::{Level, Output, Speed},
+    gpio::{Input, Level, Output, Pull, Speed},
     i2c::{Config as I2cConfig, I2c},
     spi::{Config as SpiConfig, Spi},
     time::Hertz,
@@ -26,6 +27,7 @@ use embedded_graphics::{
 };
 use embedded_hal_bus::spi::RefCellDevice;
 use ili9341::{Ili9341, Orientation};
+use xpt2046::{Calibration, Xpt2046};
 
 const DISPLAY_CHANNELS: [u8; 11] = [12, 6, 0, 7, 8, 15, 2, 9, 13, 14, 3];
 const DISPLAY_LABELS: [&str; 11] = [
@@ -36,6 +38,29 @@ const GRAPH_X: i32 = 56;
 const GRAPH_W: u32 = 248;
 const ROW_Y0: i32 = 40;
 const ROW_H: i32 = 14;
+
+const LED_BTN_X: i32 = 170;
+const LED_BTN_Y: i32 = 200;
+const LED_BTN_W: u32 = 140;
+const LED_BTN_H: u32 = 28;
+
+const TOUCH_CAL: Calibration = Calibration {
+    x_min: 0,
+    x_max: 4095,
+    y_min: 0,
+    y_max: 4095,
+    width: 320,
+    height: 240,
+    swap_xy: false,
+    invert_x: false,
+    invert_y: false,
+};
+
+// 実測された表示レンジ（未補正）
+const TOUCH_X_MIN_MEASURED: u16 = 34;
+const TOUCH_X_MAX_MEASURED: u16 = 285;
+const TOUCH_Y_MIN_MEASURED: u16 = 26;
+const TOUCH_Y_MAX_MEASURED: u16 = 216;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -66,6 +91,8 @@ async fn main(spawner: Spawner) {
             p.PA7,
             p.PA6,
             p.PA4,
+            p.PB0,
+            p.PA12,
             p.PA0,
             p.PA1,
             p.USART2,
@@ -89,6 +116,8 @@ async fn as7343_lcd_task(
     spi_mosi: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA7>,
     spi_miso: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA6>,
     lcd_cs: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA4>,
+    touch_cs: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PB0>,
+    touch_irq: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA12>,
     lcd_dc: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA0>,
     lcd_rst: embassy_stm32::Peri<'static, embassy_stm32::peripherals::PA1>,
     uart2: embassy_stm32::Peri<'static, embassy_stm32::peripherals::USART2>,
@@ -102,17 +131,23 @@ async fn as7343_lcd_task(
 
     // SPI/LCD init
     let mut spi_config = SpiConfig::default();
-    spi_config.frequency = Hertz(84_000_000);
+    // XPT2046は高速SPIに弱いため、LCDと共有バス時は低めに設定
+    spi_config.frequency = Hertz(2_000_000);
     let spi = Spi::new_blocking(spi1, spi_sck, spi_mosi, spi_miso, spi_config);
     let spi_bus = RefCell::new(spi);
 
     let cs1 = Output::new(lcd_cs, Level::High, Speed::VeryHigh);
+    let cs2 = Output::new(touch_cs, Level::High, Speed::VeryHigh);
+    let penirq = Input::new(touch_irq, Pull::Up);
     let dc = Output::new(lcd_dc, Level::Low, Speed::VeryHigh);
     let mut rst = Output::new(lcd_rst, Level::Low, Speed::High);
     rst.set_high();
 
     let spi_disp_device = RefCellDevice::new_no_delay(&spi_bus, cs1).unwrap();
     let spi_disp_iface = SPIInterface::new(spi_disp_device, dc);
+
+    let spi_touch_device = RefCellDevice::new_no_delay(&spi_bus, cs2).unwrap();
+    let mut touch = Xpt2046::new(spi_touch_device, penirq);
 
     let mut display = Ili9341::new(
         spi_disp_iface,
@@ -158,6 +193,8 @@ async fn as7343_lcd_task(
         Timer::after(embassy_time::Duration::from_millis(500)).await;
     }
 
+    let _ = as7343::as7343_set_led_enable(&mut i2c, false);
+
     display.clear(Rgb565::BLACK).unwrap();
     let style = MonoTextStyle::new(&FONT_6X10, Rgb565::WHITE);
 
@@ -178,6 +215,10 @@ async fn as7343_lcd_task(
             .draw(&mut display)
             .unwrap();
     }
+
+    let mut led_on = false;
+    let mut prev_touched = false;
+    draw_led_button(&mut display, style, led_on);
 
     loop {
         match as7343::as7343_data_ready(&mut i2c) {
@@ -206,6 +247,60 @@ async fn as7343_lcd_task(
                                 .unwrap();
                         }
                     }
+
+                    // タッチ座標をUART/LCDへ表示
+                    Rectangle::new(Point::new(208, 0), Size::new(112, 16))
+                        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
+                        .draw(&mut display)
+                        .unwrap();
+
+                    if let Ok(is_touched_now) = touch.is_touched() {
+                        if is_touched_now {
+                            if let Ok(p_raw) = touch.read_point(&TOUCH_CAL) {
+                                let p = normalize_touch_point(p_raw);
+
+                                let _ = log_uart.blocking_write(b"touch x=");
+                                let mut xbuf = [0u8; 8];
+                                let mut ybuf = [0u8; 8];
+                                let xs = u32_to_str(p.x as u32, &mut xbuf);
+                                let _ = log_uart.blocking_write(xs.as_bytes());
+                                let _ = log_uart.blocking_write(b",y=");
+                                let ys = u32_to_str(p.y as u32, &mut ybuf);
+                                let _ = log_uart.blocking_write(ys.as_bytes());
+                                let _ = log_uart.blocking_write(b"\r\n");
+
+                                Text::new("T:", Point::new(210, 12), style)
+                                    .draw(&mut display)
+                                    .unwrap();
+                                Text::new(xs, Point::new(224, 12), style)
+                                    .draw(&mut display)
+                                    .unwrap();
+                                Text::new(",", Point::new(252, 12), style)
+                                    .draw(&mut display)
+                                    .unwrap();
+                                Text::new(ys, Point::new(258, 12), style)
+                                    .draw(&mut display)
+                                    .unwrap();
+
+                                if !prev_touched && point_in_led_button(p) {
+                                    led_on = !led_on;
+                                    let _ = as7343::as7343_set_led_enable(&mut i2c, led_on);
+                                    draw_led_button(&mut display, style, led_on);
+                                    if led_on {
+                                        let _ = log_uart.blocking_write(b"LED ON\r\n");
+                                    } else {
+                                        let _ = log_uart.blocking_write(b"LED OFF\r\n");
+                                    }
+                                }
+                            }
+                        } else {
+                            Text::new("T:---,---", Point::new(210, 12), style)
+                                .draw(&mut display)
+                                .unwrap();
+                        }
+
+                        prev_touched = is_touched_now;
+                    }
                 }
                 Err(_) => {
                     let _ = log_uart.blocking_write(b"as7343 read err\r\n");
@@ -221,6 +316,54 @@ async fn as7343_lcd_task(
     }
 }
 
+
+fn point_in_led_button(p: xpt2046::Point) -> bool {
+    let x = p.x as i32;
+    let y = p.y as i32;
+    x >= LED_BTN_X
+        && x < LED_BTN_X + LED_BTN_W as i32
+        && y >= LED_BTN_Y
+        && y < LED_BTN_Y + LED_BTN_H as i32
+}
+
+fn draw_led_button<D>(display: &mut D, style: MonoTextStyle<'_, Rgb565>, led_on: bool)
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    let fill = if led_on {
+        Rgb565::new(0, 40, 0)
+    } else {
+        Rgb565::new(20, 0, 0)
+    };
+
+    Rectangle::new(Point::new(LED_BTN_X, LED_BTN_Y), Size::new(LED_BTN_W, LED_BTN_H))
+        .into_styled(PrimitiveStyle::with_fill(fill))
+        .draw(display)
+        .ok();
+
+    let label = if led_on { "LED: ON" } else { "LED: OFF" };
+    Text::new(label, Point::new(LED_BTN_X + 10, LED_BTN_Y + 18), style)
+        .draw(display)
+        .ok();
+}
+
+fn normalize_touch_point(p: xpt2046::Point) -> xpt2046::Point {
+    let x = map_range_clamped(p.x, TOUCH_X_MIN_MEASURED, TOUCH_X_MAX_MEASURED, 320);
+    let y = map_range_clamped(p.y, TOUCH_Y_MIN_MEASURED, TOUCH_Y_MAX_MEASURED, 240);
+
+    xpt2046::Point { x, y: 239 - y }
+}
+
+fn map_range_clamped(v: u16, in_min: u16, in_max: u16, out_max: u16) -> u16 {
+    if in_max <= in_min || out_max == 0 {
+        return 0;
+    }
+
+    let c = v.clamp(in_min, in_max);
+    let num = (c - in_min) as u32 * (out_max as u32 - 1);
+    let den = (in_max - in_min) as u32;
+    (num / den) as u16
+}
 
 fn color_for_slot(slot: usize) -> Rgb565 {
     match slot {

@@ -20,6 +20,7 @@ const REG_ID: u8 = 0x5A; // bank1
 const DEFAULT_ATIME: u8 = 29;       // Tint = (ATIME + 1) * (ASTEP + 1) * 2.78uSec
 const DEFAULT_ASTEP: u16 = 599;
 const DEFAULT_AGAIN: u8 = 9; // 256x
+const DEFAULT_LED_CURRENT: u8 = 0x20; // LED電流設定(0..0x7F)
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,10 +105,31 @@ pub fn as7343_init_default<I: I2c>(i2c: &mut I) -> Result<(), As7343Error<I::Err
     en |= 1 << 1;
     as7343_write_u8(i2c, REG_ENABLE, en)?;
 
-    // LED control
-    as7343_write_u8(i2c, REG_LED, 0x00)?;
+    // LED control (OFF, 電流値のみ設定)
+    as7343_write_u8(i2c, REG_LED, DEFAULT_LED_CURRENT & 0x7F)?;
 
     Ok(())
+}
+
+/// AS7343内蔵LEDのON/OFF
+pub fn as7343_set_led_enable<I: I2c>(
+    i2c: &mut I,
+    enable: bool,
+) -> Result<(), As7343Error<I::Error>> {
+    let mut led = as7343_read_u8(i2c, REG_LED)?;
+
+    // 下位7bitは電流設定。0の場合は見えにくいためデフォルトを入れる
+    if (led & 0x7F) == 0 {
+        led = (led & 0x80) | (DEFAULT_LED_CURRENT & 0x7F);
+    }
+
+    if enable {
+        led |= 1 << 7;
+    } else {
+        led &= !(1 << 7);
+    }
+
+    as7343_write_u8(i2c, REG_LED, led)
 }
 
 /// データ準備完了フラグ（STATUS2 bit6 = AVALID）
